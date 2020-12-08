@@ -147,22 +147,6 @@ def process_instance(in_queue, out_queue, max_seq_length, max_predictions_per_se
     features["next_sentence_labels"] = create_int_feature([next_sentence_label])
 
     out_queue.put(tf.train.Example(features=tf.train.Features(feature=features)))
-  
-    tf.logging.info("*** Example ***")
-    tf.logging.info("tokens: %s" % " ".join(
-        [tokenization.printable_text(x) for x in instance.tokens]))
-
-    for feature_name in features.keys():
-      feature = features[feature_name]
-      values = []
-      if feature.int64_list.value:
-        values = feature.int64_list.value
-      elif feature.float_list.value:
-        values = feature.float_list.value
-      tf.logging.info(
-          "%s: %s" % (feature_name, " ".join([str(x) for x in values])))
-    
-    exit()
 
 
 def consumer(out_queue, output_files, proc):
