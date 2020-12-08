@@ -331,7 +331,7 @@ def create_training_instances(input_files, max_seq_length,
             all_documents = []
           all_documents.append([])
 
-        if len(line.strip()) > 0:
+        if len(line.strip().split()) > 0:
           all_documents[-1].append(line)
 
       if len(all_documents) > 0:
@@ -347,7 +347,7 @@ def create_instances_from_document(tokenizer,
 
   def tok_doc(doc):
     return [tokenizer.tokenize(entry) for entry in doc]
-  
+
   document = tok_doc(all_documents[document_index])
 
   # Account for [CLS], [SEP], [SEP]
