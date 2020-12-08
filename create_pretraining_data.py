@@ -22,6 +22,9 @@ import collections
 import random
 import tokenization
 import tensorflow as tf
+from multiprocessing import Queue, Process, cpu_count
+from tqdm import tqdm
+
 
 flags = tf.flags
 
@@ -64,6 +67,10 @@ flags.DEFINE_float(
     "Probability of creating sequences which are shorter than the "
     "maximum length.")
 
+flags.DEFINE_integer(
+    "processes", cpu_count(),
+    "Number of parallel processes to use")
+
 
 class TrainingInstance(object):
   """A single training instance (sentence pair)."""
@@ -93,26 +100,27 @@ class TrainingInstance(object):
     return self.__str__()
 
 
-def write_instance_to_example_files(instances, tokenizer, max_seq_length,
-                                    max_predictions_per_seq, output_files):
-  """Create TF example files from `TrainingInstance`s."""
-  writers = []
-  for output_file in output_files:
-    writers.append(tf.python_io.TFRecordWriter(output_file))
 
-  writer_index = 0
 
-  total_written = 0
-  for (inst_index, instance) in enumerate(instances):
+def process_instance(in_queue, out_queue, max_seq_length, max_predictions_per_seq):
+  tokenizer = get_tokenizer()
+
+  i = 0
+  while True:
+    instance = in_queue.get()
+    if instance is None:
+      out_queue.put(None)
+      break
+  
     input_ids = tokenizer.convert_tokens_to_ids(instance.tokens)
     input_mask = [1] * len(input_ids)
     segment_ids = list(instance.segment_ids)
     assert len(input_ids) <= max_seq_length
 
-    while len(input_ids) < max_seq_length:
-      input_ids.append(0)
-      input_mask.append(0)
-      segment_ids.append(0)
+    if len(input_ids) < max_seq_length:
+      input_ids += [0] * (max_seq_length - len(input_ids))
+      input_mask += [0] * (max_seq_length - len(input_mask))
+      segment_ids += [0] * (max_seq_length - len(segment_ids))
 
     assert len(input_ids) == max_seq_length
     assert len(input_mask) == max_seq_length
@@ -122,10 +130,10 @@ def write_instance_to_example_files(instances, tokenizer, max_seq_length,
     masked_lm_ids = tokenizer.convert_tokens_to_ids(instance.masked_lm_labels)
     masked_lm_weights = [1.0] * len(masked_lm_ids)
 
-    while len(masked_lm_positions) < max_predictions_per_seq:
-      masked_lm_positions.append(0)
-      masked_lm_ids.append(0)
-      masked_lm_weights.append(0.0)
+    if len(masked_lm_positions) < max_predictions_per_seq:
+      masked_lm_positions += [0] * (max_predictions_per_seq - len(masked_lm_positions))
+      masked_lm_ids += [0] * (max_predictions_per_seq - len(masked_lm_ids))
+      masked_lm_weights += [0] * (max_predictions_per_seq - len(masked_lm_weights))
 
     next_sentence_label = 1 if instance.is_random_next else 0
 
@@ -138,32 +146,88 @@ def write_instance_to_example_files(instances, tokenizer, max_seq_length,
     features["masked_lm_weights"] = create_float_feature(masked_lm_weights)
     features["next_sentence_labels"] = create_int_feature([next_sentence_label])
 
-    tf_example = tf.train.Example(features=tf.train.Features(feature=features))
+    out_queue.put(tf.train.Example(features=tf.train.Features(feature=features)))
+  
+    tf.logging.info("*** Example ***")
+    tf.logging.info("tokens: %s" % " ".join(
+        [tokenization.printable_text(x) for x in instance.tokens]))
 
-    writers[writer_index].write(tf_example.SerializeToString())
-    writer_index = (writer_index + 1) % len(writers)
+    for feature_name in features.keys():
+      feature = features[feature_name]
+      values = []
+      if feature.int64_list.value:
+        values = feature.int64_list.value
+      elif feature.float_list.value:
+        values = feature.float_list.value
+      tf.logging.info(
+          "%s: %s" % (feature_name, " ".join([str(x) for x in values])))
+    
+    exit()
 
-    total_written += 1
 
-    if inst_index < 20:
-      tf.logging.info("*** Example ***")
-      tf.logging.info("tokens: %s" % " ".join(
-          [tokenization.printable_text(x) for x in instance.tokens]))
+def consumer(out_queue, output_files, proc):
+  writers = []
+  for output_file in output_files:
+    writers.append(tf.python_io.TFRecordWriter(output_file))
 
-      for feature_name in features.keys():
-        feature = features[feature_name]
-        values = []
-        if feature.int64_list.value:
-          values = feature.int64_list.value
-        elif feature.float_list.value:
-          values = feature.float_list.value
-        tf.logging.info(
-            "%s: %s" % (feature_name, " ".join([str(x) for x in values])))
+  writer_index = 0
+  total_written = 0
+  ended = 0
+
+  while True:
+    tf_example = out_queue.get()
+    if tf_example is None:
+      ended += 1
+      if ended == proc:
+        break
+
+    else:
+      writers[writer_index].write(tf_example.SerializeToString())
+      writer_index = (writer_index + 1) % len(writers)
+      total_written += 1
 
   for writer in writers:
     writer.close()
-
   tf.logging.info("Wrote %d total instances", total_written)
+
+
+def filler(iterator, in_queue, proc):
+  for instance in iterator:
+    in_queue.put(instance)
+  for _ in range(proc):
+    in_queue.put(None)
+
+
+def write_instance_to_example_files(instances, max_seq_length,
+                                    max_predictions_per_seq, output_files, proc):
+  """Create TF example files from `TrainingInstance`s."""
+  in_queue = Queue()
+  out_queue = Queue()
+
+  tf.logging.info(f"Writer: Feeding processes")
+  filler_process = Process(target=filler, args=(instances, in_queue, proc))
+
+  processes = [Process(target=process_instance, args=(in_queue, out_queue, max_seq_length, max_predictions_per_seq)) for _ in range(proc)]
+  tf.logging.info(f"Writer: Starting processes")
+  for p in processes:
+    p.start()
+
+  tf.logging.info(f"Writer: Starting feeder")
+  filler_process.start()
+
+  tf.logging.info(f"Writer: Starting consumer")
+  consumer_process = Process(target=consumer, args=(out_queue, output_files, proc))
+  tf.logging.info(f"Writer: Starting consumer")
+  consumer_process.start()
+  consumer_process.join()
+
+  tf.logging.info(f"Writer: Waiting processes")
+  for p in processes:
+    p.join()
+
+  tf.logging.info(f"Writer: Waiting consumer")
+  filler_process.join()
+
 
 
 def create_int_feature(values):
@@ -176,11 +240,87 @@ def create_float_feature(values):
   return feature
 
 
-def create_training_instances(input_files, tokenizer, max_seq_length,
+
+
+
+def in_filler(in_queue, n_docs, dupe_factor, proc):
+  
+  for _ in range(dupe_factor):
+    for document_index in range(n_docs):
+      in_queue.put(document_index)
+  for _ in range(proc):
+    in_queue.put(None)
+
+def in_processor(in_queue, out_queue, all_documents, max_seq_length, short_seq_prob,
+                 masked_lm_prob, max_predictions_per_seq, vocab_words, rng):
+  
+  tokenizer = get_tokenizer()
+
+  while True:
+    document_index = in_queue.get()
+    if document_index is None:
+      out_queue.put(None)
+      break
+
+    out_queue.put(
+      create_instances_from_document(tokenizer,
+        all_documents, document_index, max_seq_length, short_seq_prob,
+        masked_lm_prob, max_predictions_per_seq, vocab_words, rng)
+    )
+
+
+
+def preprocess(all_documents, rng, dupe_factor, max_seq_length, short_seq_prob,
+               masked_lm_prob, max_predictions_per_seq, proc):
+  # Remove empty documents
+  tf.logging.info(f"Cleaning docs")
+  all_documents = [x for x in all_documents if x]
+  # rng.shuffle(all_documents)
+  vocab_words = list(get_tokenizer().vocab.keys())
+
+  n_docs = len(all_documents)
+  in_queue = Queue()
+  out_queue = Queue()
+
+  tf.logging.info(f"Processer: Feeding processes")
+  filler_process = Process(target=in_filler, args=(in_queue, n_docs, dupe_factor, proc))
+
+  processes = [Process(target=in_processor, args=(in_queue, out_queue, all_documents, max_seq_length, short_seq_prob,
+                 masked_lm_prob, max_predictions_per_seq, vocab_words, rng)) for _ in range(proc)]
+  tf.logging.info(f"Processer: Starting processes")
+  for p in processes:
+    p.start()
+
+  tf.logging.info(f"Processer: Starting feeder")
+  filler_process.start()
+
+  instances = []
+  ended = 0
+  for _ in tqdm(range(n_docs * dupe_factor + proc), desc="Processing docs", total=n_docs * dupe_factor + proc):
+    instance = out_queue.get()
+    if instance is None:
+      ended += 1
+    else:
+      instances.extend(instance)
+
+  assert ended == proc, f"{ended} vs {proc}"
+
+  tf.logging.info(f"Processer: Waiting processes")
+  for p in processes:
+    p.join()
+
+  tf.logging.info(f"Processer: Waiting feeder")
+  filler_process.join()
+
+  rng.shuffle(instances)
+  tf.logging.info(f"Processer: Processed {len(instances)} instances")
+
+  return instances
+
+def create_training_instances(input_files, max_seq_length,
                               dupe_factor, short_seq_prob, masked_lm_prob,
-                              max_predictions_per_seq, rng):
+                              max_predictions_per_seq, rng, proc):
   """Create `TrainingInstance`s from raw text."""
-  all_documents = [[]]
 
   # Input file format:
   # (1) One sentence per line. These should ideally be actual sentences, not
@@ -188,43 +328,44 @@ def create_training_instances(input_files, tokenizer, max_seq_length,
   # sentence boundaries for the "next sentence prediction" task).
   # (2) Blank lines between documents. Document boundaries are needed so
   # that the "next sentence prediction" task doesn't span between documents.
+  all_documents = [[]]
+  batch = 10000
+
   for input_file in input_files:
-    with tf.gfile.GFile(input_file, "r") as reader:
-      while True:
-        line = tokenization.convert_to_unicode(reader.readline())
-        if not line:
-          break
-        line = line.strip()
+    with tf.io.gfile.GFile(input_file, "r") as reader:
+      for line in reader:
+
+        line = tokenization.convert_to_unicode(line).strip()
 
         # Empty lines are used as document delimiters
         if not line:
+          if len(all_documents) >= batch:
+            yield from preprocess(all_documents, rng, dupe_factor, max_seq_length, short_seq_prob,
+                                  masked_lm_prob, max_predictions_per_seq, proc)
+
+            tf.logging.info(f"Processed {len(all_documents)} documents")
+
+            all_documents = []
           all_documents.append([])
-        tokens = tokenizer.tokenize(line)
-        if tokens:
-          all_documents[-1].append(tokens)
 
-  # Remove empty documents
-  all_documents = [x for x in all_documents if x]
-  rng.shuffle(all_documents)
+        if len(line.strip()) > 0:
+          all_documents[-1].append(line)
 
-  vocab_words = list(tokenizer.vocab.keys())
-  instances = []
-  for _ in range(dupe_factor):
-    for document_index in range(len(all_documents)):
-      instances.extend(
-          create_instances_from_document(
-              all_documents, document_index, max_seq_length, short_seq_prob,
-              masked_lm_prob, max_predictions_per_seq, vocab_words, rng))
-
-  rng.shuffle(instances)
-  return instances
+      if len(all_documents) > 0:
+        yield from preprocess(all_documents, rng, dupe_factor, max_seq_length, short_seq_prob,
+                                  masked_lm_prob, max_predictions_per_seq, proc)
+        tf.logging.info(f"This was the last!")
 
 
-def create_instances_from_document(
+def create_instances_from_document(tokenizer,
     all_documents, document_index, max_seq_length, short_seq_prob,
     masked_lm_prob, max_predictions_per_seq, vocab_words, rng):
   """Creates `TrainingInstance`s for a single document."""
-  document = all_documents[document_index]
+
+  def tok_doc(doc):
+    return [tokenizer.tokenize(entry) for entry in doc]
+  
+  document = tok_doc(all_documents[document_index])
 
   # Account for [CLS], [SEP], [SEP]
   max_num_tokens = max_seq_length - 3
@@ -272,16 +413,11 @@ def create_instances_from_document(
           is_random_next = True
           target_b_length = target_seq_length - len(tokens_a)
 
-          # This should rarely go for more than one iteration for large
-          # corpora. However, just to be careful, we try to make sure that
-          # the random document is not the same as the document
-          # we're processing.
-          for _ in range(10):
+          random_document_index = document_index
+          while random_document_index == document_index:
             random_document_index = rng.randint(0, len(all_documents) - 1)
-            if random_document_index != document_index:
-              break
 
-          random_document = all_documents[random_document_index]
+          random_document = tok_doc(all_documents[random_document_index])
           random_start = rng.randint(0, len(random_document) - 1)
           for j in range(random_start, len(random_document)):
             tokens_b.extend(random_document[j])
@@ -433,11 +569,15 @@ def truncate_seq_pair(tokens_a, tokens_b, max_num_tokens, rng):
       trunc_tokens.pop()
 
 
+def get_tokenizer():
+    return tokenization.FullTokenizer(
+      vocab_file=FLAGS.vocab_file, do_lower_case=FLAGS.do_lower_case)
+
 def main(_):
   tf.logging.set_verbosity(tf.logging.INFO)
 
-  tokenizer = tokenization.FullTokenizer(
-      vocab_file=FLAGS.vocab_file, do_lower_case=FLAGS.do_lower_case)
+  import time
+  start = time.time()
 
   input_files = []
   for input_pattern in FLAGS.input_file.split(","):
@@ -449,17 +589,18 @@ def main(_):
 
   rng = random.Random(FLAGS.random_seed)
   instances = create_training_instances(
-      input_files, tokenizer, FLAGS.max_seq_length, FLAGS.dupe_factor,
+      input_files, FLAGS.max_seq_length, FLAGS.dupe_factor,
       FLAGS.short_seq_prob, FLAGS.masked_lm_prob, FLAGS.max_predictions_per_seq,
-      rng)
+      rng, FLAGS.processes)
 
   output_files = FLAGS.output_file.split(",")
   tf.logging.info("*** Writing to output files ***")
   for output_file in output_files:
     tf.logging.info("  %s", output_file)
 
-  write_instance_to_example_files(instances, tokenizer, FLAGS.max_seq_length,
-                                  FLAGS.max_predictions_per_seq, output_files)
+  write_instance_to_example_files(instances, FLAGS.max_seq_length,
+                                  FLAGS.max_predictions_per_seq, output_files, FLAGS.processes)
+  tf.logging.info(f"*** Totale elapsed time in {time.time() - start} ***")
 
 
 if __name__ == "__main__":
