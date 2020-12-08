@@ -105,7 +105,6 @@ class TrainingInstance(object):
 def process_instance(in_queue, out_queue, max_seq_length, max_predictions_per_seq):
   tokenizer = get_tokenizer()
 
-  i = 0
   while True:
     instance = in_queue.get()
     if instance is None:
