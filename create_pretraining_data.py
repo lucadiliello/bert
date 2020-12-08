@@ -312,7 +312,7 @@ def create_training_instances(input_files, max_seq_length,
   # (2) Blank lines between documents. Document boundaries are needed so
   # that the "next sentence prediction" task doesn't span between documents.
   all_documents = [[]]
-  batch = 10000
+  batch = 20000
 
   for input_file in input_files:
     with tf.io.gfile.GFile(input_file, "r") as reader:
@@ -349,6 +349,10 @@ def create_instances_from_document(tokenizer,
     return [tokenizer.tokenize(entry) for entry in doc]
 
   document = tok_doc(all_documents[document_index])
+  document = [sentence for sentence in document if len(sentence) > 0]
+
+  if len(document) == 0:
+    return []
 
   # Account for [CLS], [SEP], [SEP]
   max_num_tokens = max_seq_length - 3
